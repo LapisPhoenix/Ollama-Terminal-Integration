@@ -66,7 +66,7 @@ def get_system_info() -> str:
             f"- GPU: {gpu_info}\n"
             f"- CPU: {cpu_info}\n"
             f"- Memory: {memory_info}\n"
-            f"- Disk: {disk_info}\n\n"
+            f"- Disk: {disk_info}"
         )
         return system_info
     except Exception as e:
@@ -89,6 +89,6 @@ if __name__ == "__main__":
     user_prompt = ' '.join(parts)
 
     # Prepend system information to the user's prompt
-    full_prompt = get_system_info() + f"User Prompt: {user_prompt}"
+    full_prompt = f"{get_system_info()}\n\nInstructions: You should respond in short, consise answers. Your output is inside a console. Do not use markdown formatting. Do not apologize for not being able to do something.\n\nUser Prompt: {user_prompt}"
     
     print(oi.generate(model, full_prompt), file=stderr if quiet else stdout)

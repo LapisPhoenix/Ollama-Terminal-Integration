@@ -1,94 +1,98 @@
-import platform
-import socket
-import psutil
-import GPUtil
-from sys import argv, stderr, stdout
-from os import environ
-from datetime import datetime
-from requests import post
+from inspect import signature
+from pathlib import Path
+from time import time
+# from pprint import pprint
+from tool import load, json_type_to_python_type
+from interface import OllamaInterface
+from chat import Message, Role, ChatHistory
 
 
-class OllamaInterface:
-    def __init__(self) -> None:
-        self._routes = {
-            "generate": "/api/generate"
-        }
-        self._domain = "http://127.0.0.1:11434"
+ollama = OllamaInterface()
+registry, tools = load(Path("./tools"))
+model = "phi3:medium-128k"
 
-    def generate(self, model: str, prompt: str) -> str:
-        url = self._domain + self._routes["generate"]
-        payload = {
-            "model": model,
-            "prompt": prompt,
-            "stream": False
-        }
-
-        try:
-            resp = post(url, json=payload)
-            resp.raise_for_status()
-            data = resp.json()
-            response = data.get("response", "No response field in API output")
-            return response
-        except Exception as e:
-            return f"Error: Failed to get response from Ollama: {e}"
+with open("systemprompt.txt", "r") as sysprompt:
+    systemprompt = sysprompt.read()
 
 
-def get_system_info() -> str:
-    """Gather system information to include in the prompt."""
-    try:
-        current_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S %Z")
+history_file = Path("chat_history.json")
+chat_history = ChatHistory()
+chat_history.load(history_file)
 
-        os_name = platform.system()
-        os_version = platform.release()
-        os_architecture = platform.machine()
 
-        hostname = socket.gethostname()
+print(f"Using System Prompt:\n{systemprompt}")
 
-        gpus = GPUtil.getGPUs()
-        if not gpus:
-            return "No GPU detected"
-        gpu_info = ", ".join([f"{gpu.name}, {gpu.memoryTotal/1024:.2f} GB VRAM" for gpu in gpus])
+chat_history.add(
+    Message(
+        role=Role.system,
+        content=systemprompt
+    )
+)
 
-        shell = environ.get("SHELL", "Unknown")
 
-        cpu_info = f"{psutil.cpu_count(logical=True)} logical CPUs, {psutil.cpu_count(logical=False)} physical CPUs"
-        memory = psutil.virtual_memory()
-        memory_info = f"{memory.total / (1024**3):.2f} GB total, {memory.available / (1024**3):.2f} GB available"
-        disk = psutil.disk_usage('/')
-        disk_info = f"{disk.total / (1024**3):.2f} GB total, {disk.free / (1024**3):.2f} GB free"
+print("Loaded!")
+# print("Tools Loaded:")
+# pprint(tools)
+# print("Registry:") 
+# pprint(registry)
 
-        system_info = (
-            f"System Information:\n"
-            f"- Shell: {shell}\n"
-            f"- Date and Time: {current_time}\n"
-            f"- Hostname: {hostname}\n"
-            f"- OS: {os_name} {os_version} ({os_architecture})\n"
-            f"- GPU: {gpu_info}\n"
-            f"- CPU: {cpu_info}\n"
-            f"- Memory: {memory_info}\n"
-            f"- Disk: {disk_info}"
+
+session_start = time()
+while True:
+    # pprint(chat_history)
+    prompt = input(">>> ")
+    if prompt == "exit":
+        print("Goodbye!")
+        break
+    msg = Message(
+        role=Role.user,
+        content=prompt
+    )
+    chat_history.add(msg)
+    assistant_response = ollama.chat(model, chat_history.get_history(True)) # , tools=tools)
+    chat_history.add(assistant_response)
+    if not assistant_response.tool_calls:
+        print(f"Assistant: {assistant_response.content}")
+        continue
+
+    calls = assistant_response.tool_calls
+
+    for call in calls:
+        name = call["function"]["name"]
+        args = call["function"]["arguments"]
+        func = registry[name]
+        func_sig = signature(func)
+        tool_schema = next(t for t in tools if t["function"]["name"] == name)
+        props = tool_schema["function"]["parameters"]["properties"]
+
+        cast_args = {}
+        for k, v in args.items():
+            if k in props:
+                try:
+                    cast_args[k] = json_type_to_python_type(props[k]["type"], v)
+                except Exception:
+                    cast_args[k] = v  # fallback
+
+        cast_args = {k: v for k, v in cast_args.items() if k in func_sig.parameters}
+
+        print(f"The AI wants to run \"{name}\" with args {cast_args}. Actual Params: {func_sig.parameters}")
+        result = func(**cast_args)
+        print(f"Result: {result}")
+        tool_message = Message(
+            role=Role.tool,
+            content=str(result),
+            tool_name=name
         )
-        return system_info
-    except Exception as e:
-        return f"System Information: Unable to gather details ({e})\n\n"
-
-
-if __name__ == "__main__":
-    oi = OllamaInterface()
-    model = "llama3.2"
-    parts = argv[1:]
-    if parts == []:
-        print("You must have a prompt!", file=stderr)
-        exit(1)
+        chat_history.add(tool_message)
     
-    if parts[0] == "-q":
-        quiet = True
-        parts = parts[1:]
-    else:
-        quiet = False
-    user_prompt = ' '.join(parts)
+    followup = ollama.chat(model, chat_history.get_history(True))  # , tools)
+    chat_history.add(followup)
 
-    # Prepend system information to the user's prompt
-    full_prompt = f"{get_system_info()}\n\nInstructions: You should respond in short, consise answers. Your output is inside a console. Do not use markdown formatting. Do not apologize for not being able to do something.\n\nUser Prompt: {user_prompt}"
-    
-    print(oi.generate(model, full_prompt), file=stderr if quiet else stdout)
+    print(f"Assistant: {followup.content}")
+
+chat_history.add(Message(
+    role=Role.system,
+    content=f"End of Session. Session lasted {time() - session_start:.2f} seconds. Do not refer to past sessions unless expicitly stated."
+))
+
+chat_history.save(history_file)
